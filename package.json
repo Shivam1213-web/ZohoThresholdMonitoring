@@ -1,0 +1,23 @@
+{
+  "name": "zohothreasholdmonitoring",
+  "version": "1.0.0",
+  "description": "Automated monitoring scripts for Zoho Books (US edition) that track:",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node tests/zoho-books-workflow.plan.e2e.js",
+    "test:headed": "cross-env HEADLESS=false node tests/zoho-books-workflow.plan.e2e.js",
+    "test:headless": "cross-env HEADLESS=true node tests/zoho-books-workflow.plan.e2e.js",
+    "test:debug": "cross-env DEBUG_MODE=true HEADLESS=false node tests/zoho-books-workflow.plan.e2e.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "playwright": "^1.58.2"
+  }
+}

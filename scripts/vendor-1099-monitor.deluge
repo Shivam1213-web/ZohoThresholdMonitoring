@@ -1,0 +1,419 @@
+// ============================================================
+// 1099 VENDOR PAYMENT THRESHOLD MONITOR
+// Zoho Books - Deluge Scheduled Custom Function
+// ============================================================
+// PURPOSE: Tracks cumulative payments to each vendor for the
+//          current tax year, compares against the $600 threshold
+//          for 1099-NEC/MISC filing, and sends alerts when
+//          vendors approach or exceed the threshold.
+//
+// SCHEDULE: Run weekly (recommended) or monthly
+//
+// SETUP:
+//   1. Go to Zoho Books > Settings > Automation > Custom Functions
+//   2. Create a new Scheduled Function
+//   3. Paste this script
+//   4. Replace ORG_ID and ALERT_EMAIL below
+//   5. Set schedule to weekly (e.g., every Monday at 9 AM)
+//
+// NOTES:
+//   - Tracks ALL vendors, not just those flagged as 1099-eligible
+//   - Highlights vendors who are NOT marked as 1099-eligible but
+//     have exceeded the $600 threshold (a common oversight)
+// ============================================================
+
+// ----- CONFIGURATION (EDIT THESE) -----
+orgId = "YOUR_ORG_ID_HERE";
+alertEmail = "tax-team@yourcompany.com";
+alertCcEmail = "";  // Optional CC recipient
+
+// 1099 Thresholds (update if IRS changes these)
+necThreshold = 600.00;     // 1099-NEC: Non-employee compensation
+miscThreshold = 600.00;    // 1099-MISC: Rents, prizes, other income
+miscRoyaltyThreshold = 10.00;  // 1099-MISC: Royalties
+
+// Alert at this % of threshold
+warningPercent = 83;  // ~$500 of $600
+// ----- END CONFIGURATION -----
+
+// ----- MAIN LOGIC -----
+
+// Determine date range: current tax year (calendar year)
+currentYear = zoho.currentdate.getYear();
+startDate = currentYear + "-01-01";
+endDate = zoho.currentdate.toString("yyyy-MM-dd");
+
+// Step 1: Get all vendors with their 1099 eligibility status
+vendorMap = Map();  // vendor_id -> {name, is_1099, tax_id}
+page = 1;
+hasMore = true;
+
+while (hasMore)
+{
+	params = Map();
+	params.put("organization_id", orgId);
+	params.put("contact_type", "vendor");
+	params.put("page", page);
+	params.put("per_page", 200);
+
+	response = invokeurl
+	[
+		url: "https://www.zohoapis.com/books/v3/contacts"
+		type: GET
+		parameters: params
+		connection: "zohobooks"
+	];
+
+	contacts = response.get("contacts");
+
+	if(contacts == null || contacts.isEmpty())
+	{
+		hasMore = false;
+	}
+	else
+	{
+		for each contact in contacts
+		{
+			vendorId = contact.get("contact_id");
+			vendorName = contact.get("contact_name");
+			// The 1099-eligible field name may vary by API version
+			// Common field names: is_1099_eligible, track_1099
+			is1099 = ifnull(contact.get("track_1099"), false);
+			if(is1099 == null)
+			{
+				is1099 = ifnull(contact.get("is_1099_eligible"), false);
+			}
+			taxId = ifnull(contact.get("tax_id_value"), "");
+
+			vendorMap.put(vendorId, {
+				"name": vendorName,
+				"is_1099": is1099,
+				"tax_id": taxId
+			});
+		}
+
+		pageContext = response.get("page_context");
+		if(pageContext != null && pageContext.get("has_more_page") == true)
+		{
+			page = page + 1;
+		}
+		else
+		{
+			hasMore = false;
+		}
+	}
+}
+
+// Step 2: Get all vendor payments for the current year
+paymentsByVendor = Map();  // vendor_id -> total_amount
+page = 1;
+hasMore = true;
+totalPaymentsProcessed = 0;
+
+while (hasMore)
+{
+	params = Map();
+	params.put("organization_id", orgId);
+	params.put("date_start", startDate);
+	params.put("date_end", endDate);
+	params.put("page", page);
+	params.put("per_page", 200);
+
+	response = invokeurl
+	[
+		url: "https://www.zohoapis.com/books/v3/vendorpayments"
+		type: GET
+		parameters: params
+		connection: "zohobooks"
+	];
+
+	payments = response.get("vendorpayments");
+
+	if(payments == null || payments.isEmpty())
+	{
+		hasMore = false;
+	}
+	else
+	{
+		for each payment in payments
+		{
+			vendorId = payment.get("vendor_id");
+			amount = payment.get("amount").toDecimal();
+
+			currentTotal = ifnull(paymentsByVendor.get(vendorId), 0.0);
+			paymentsByVendor.put(vendorId, currentTotal + amount);
+			totalPaymentsProcessed = totalPaymentsProcessed + 1;
+		}
+
+		pageContext = response.get("page_context");
+		if(pageContext != null && pageContext.get("has_more_page") == true)
+		{
+			page = page + 1;
+		}
+		else
+		{
+			hasMore = false;
+		}
+	}
+}
+
+// Also include bill payments (direct payments not through vendor payments module)
+page = 1;
+hasMore = true;
+
+while (hasMore)
+{
+	params = Map();
+	params.put("organization_id", orgId);
+	params.put("date_start", startDate);
+	params.put("date_end", endDate);
+	params.put("status", "paid");
+	params.put("page", page);
+	params.put("per_page", 200);
+
+	response = invokeurl
+	[
+		url: "https://www.zohoapis.com/books/v3/bills"
+		type: GET
+		parameters: params
+		connection: "zohobooks"
+	];
+
+	bills = response.get("bills");
+
+	if(bills == null || bills.isEmpty())
+	{
+		hasMore = false;
+	}
+	else
+	{
+		for each bill in bills
+		{
+			vendorId = bill.get("vendor_id");
+			// Use the paid amount (total minus balance due)
+			total = ifnull(bill.get("total"), 0).toDecimal();
+			balanceDue = ifnull(bill.get("balance"), 0).toDecimal();
+			paidAmount = total - balanceDue;
+
+			if(paidAmount > 0)
+			{
+				// Note: this may double-count if vendor payments are
+				// already linked to bills. Check your Zoho Books setup
+				// and adjust if needed (see setup guide for details).
+				// For most setups, using EITHER vendorpayments OR bills is correct.
+				// Comment out this section if using vendorpayments above.
+			}
+		}
+
+		pageContext = response.get("page_context");
+		if(pageContext != null && pageContext.get("has_more_page") == true)
+		{
+			page = page + 1;
+		}
+		else
+		{
+			hasMore = false;
+		}
+	}
+}
+
+// ----- THRESHOLD COMPARISON AND ALERT GENERATION -----
+criticalAlerts = List();     // Exceeded $600
+warningAlerts = List();      // Approaching $600 (>= 83%)
+missingFlagAlerts = List();  // Exceeded but NOT marked as 1099-eligible
+missingTaxIdAlerts = List(); // 1099-eligible but no TIN on file
+summaryRows = List();
+
+for each entry in paymentsByVendor.entrySet()
+{
+	vendorId = entry.getKey();
+	totalPaid = entry.getValue();
+
+	vendorInfo = vendorMap.get(vendorId);
+	if(vendorInfo == null)
+	{
+		vendorName = "Unknown Vendor (" + vendorId + ")";
+		is1099 = false;
+		taxId = "";
+	}
+	else
+	{
+		vendorName = vendorInfo.get("name");
+		is1099 = vendorInfo.get("is_1099");
+		taxId = vendorInfo.get("tax_id");
+	}
+
+	thresholdPercent = (totalPaid / necThreshold * 100).round(1);
+
+	// Check if threshold exceeded
+	if(totalPaid >= necThreshold)
+	{
+		alertMsg = vendorName + ": $" + totalPaid.round(2) + " paid YTD (" + thresholdPercent + "% of $" + necThreshold.round(0) + " threshold)";
+
+		if(is1099 == true)
+		{
+			alertMsg = alertMsg + " [1099-ELIGIBLE]";
+			criticalAlerts.add(alertMsg);
+
+			// Check for missing TIN
+			if(taxId == null || taxId.trim().isEmpty())
+			{
+				missingTaxIdAlerts.add(vendorName + ": Marked as 1099-eligible but NO TAX ID on file. $" + totalPaid.round(2) + " paid YTD.");
+			}
+		}
+		else
+		{
+			alertMsg = alertMsg + " [NOT MARKED AS 1099-ELIGIBLE]";
+			missingFlagAlerts.add(alertMsg);
+		}
+	}
+	else if(thresholdPercent >= warningPercent)
+	{
+		alertMsg = vendorName + ": $" + totalPaid.round(2) + " paid YTD (" + thresholdPercent + "% of $" + necThreshold.round(0) + " threshold)";
+		if(is1099 == true)
+		{
+			alertMsg = alertMsg + " [1099-ELIGIBLE]";
+		}
+		else
+		{
+			alertMsg = alertMsg + " [NOT FLAGGED]";
+		}
+		warningAlerts.add(alertMsg);
+	}
+
+	// Add to summary if above $100
+	if(totalPaid >= 100)
+	{
+		flagStatus = "No";
+		if(is1099 == true)
+		{
+			flagStatus = "Yes";
+		}
+		taxIdStatus = "Missing";
+		if(taxId != null && !taxId.trim().isEmpty())
+		{
+			taxIdStatus = "On File";
+		}
+		summaryRow = vendorName + " | $" + totalPaid.round(2) + " | " + flagStatus + " | " + taxIdStatus + " | " + thresholdPercent + "%";
+		summaryRows.add(summaryRow);
+	}
+}
+
+// ----- SEND EMAIL ALERT -----
+hasAlerts = !criticalAlerts.isEmpty() || !warningAlerts.isEmpty() || !missingFlagAlerts.isEmpty() || !missingTaxIdAlerts.isEmpty();
+
+if(hasAlerts)
+{
+	emailBody = "<h2>1099 Vendor Payment Threshold Monitor - " + zoho.currentdate.toString("MMM dd, yyyy") + "</h2>";
+	emailBody = emailBody + "<p>Tax Year: " + currentYear + " | Period: " + startDate + " to " + endDate + "</p>";
+	emailBody = emailBody + "<p>Total vendors tracked: " + vendorMap.size() + " | Payments processed: " + totalPaymentsProcessed + "</p>";
+
+	// Critical: Vendors over $600 and flagged as 1099
+	if(!criticalAlerts.isEmpty())
+	{
+		emailBody = emailBody + "<h3 style='color: #dc3545;'>FILING REQUIRED - 1099-Eligible Vendors Over $" + necThreshold.round(0) + "</h3>";
+		emailBody = emailBody + "<p>These vendors are marked as 1099-eligible and have been paid over the threshold:</p>";
+		emailBody = emailBody + "<ul>";
+		for each alert in criticalAlerts
+		{
+			emailBody = emailBody + "<li style='color: #dc3545; font-weight: bold;'>" + alert + "</li>";
+		}
+		emailBody = emailBody + "</ul>";
+	}
+
+	// Action needed: Vendors over $600 but NOT flagged
+	if(!missingFlagAlerts.isEmpty())
+	{
+		emailBody = emailBody + "<h3 style='color: #e65100;'>ACTION NEEDED - Vendors Over $" + necThreshold.round(0) + " But NOT Marked as 1099-Eligible</h3>";
+		emailBody = emailBody + "<p><strong>Review these vendors</strong> — they may need to be flagged as 1099-eligible in Zoho Books, or you may need to request a W-9:</p>";
+		emailBody = emailBody + "<ul>";
+		for each alert in missingFlagAlerts
+		{
+			emailBody = emailBody + "<li style='color: #e65100;'>" + alert + "</li>";
+		}
+		emailBody = emailBody + "</ul>";
+	}
+
+	// Missing TIN
+	if(!missingTaxIdAlerts.isEmpty())
+	{
+		emailBody = emailBody + "<h3 style='color: #ff6f00;'>MISSING TAX ID - W-9 Needed</h3>";
+		emailBody = emailBody + "<ul>";
+		for each alert in missingTaxIdAlerts
+		{
+			emailBody = emailBody + "<li style='color: #ff6f00;'>" + alert + "</li>";
+		}
+		emailBody = emailBody + "</ul>";
+	}
+
+	// Warning: Approaching threshold
+	if(!warningAlerts.isEmpty())
+	{
+		emailBody = emailBody + "<h3 style='color: #ffc107;'>APPROACHING - Vendors Near $" + necThreshold.round(0) + " Threshold</h3>";
+		emailBody = emailBody + "<ul>";
+		for each alert in warningAlerts
+		{
+			emailBody = emailBody + "<li style='color: #856404;'>" + alert + "</li>";
+		}
+		emailBody = emailBody + "</ul>";
+	}
+
+	// Summary table of all vendors with $100+ payments
+	if(!summaryRows.isEmpty())
+	{
+		emailBody = emailBody + "<h3>Vendor Payment Summary ($100+)</h3>";
+		emailBody = emailBody + "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; font-size: 12px;'>";
+		emailBody = emailBody + "<tr style='background-color: #f8f9fa;'><th>Vendor</th><th>YTD Paid</th><th>1099 Flag</th><th>Tax ID</th><th>% of Threshold</th></tr>";
+
+		for each row in summaryRows
+		{
+			cols = row.toList(" | ");
+			emailBody = emailBody + "<tr>";
+			for each col in cols
+			{
+				emailBody = emailBody + "<td>" + col + "</td>";
+			}
+			emailBody = emailBody + "</tr>";
+		}
+		emailBody = emailBody + "</table>";
+	}
+
+	emailBody = emailBody + "<hr>";
+	emailBody = emailBody + "<p style='font-size: 11px; color: #6c757d;'>";
+	emailBody = emailBody + "This is an automated alert from your Zoho Books 1099 Threshold Monitor.<br>";
+	emailBody = emailBody + "Current 1099-NEC/MISC threshold: $" + necThreshold.round(0) + " for non-employee compensation.<br>";
+	emailBody = emailBody + "Verify current IRS thresholds at <a href='https://www.irs.gov/forms-pubs/about-form-1099-nec'>irs.gov</a>.";
+	emailBody = emailBody + "</p>";
+
+	// Subject line
+	totalIssues = criticalAlerts.size() + missingFlagAlerts.size() + missingTaxIdAlerts.size();
+	subject = "1099 Monitor: ";
+	if(totalIssues > 0)
+	{
+		subject = subject + totalIssues + " vendors over threshold";
+	}
+	if(!warningAlerts.isEmpty())
+	{
+		if(totalIssues > 0)
+		{
+			subject = subject + ", ";
+		}
+		subject = subject + warningAlerts.size() + " approaching";
+	}
+	subject = subject + " - " + zoho.currentdate.toString("MMM dd, yyyy");
+
+	sendmail
+	[
+		from: zoho.adminuserid
+		to: alertEmail
+		cc: alertCcEmail
+		subject: subject
+		message: emailBody
+	];
+
+	info "1099 monitor: Alert sent. Over threshold: " + criticalAlerts.size() + ", Missing flag: " + missingFlagAlerts.size() + ", Missing TIN: " + missingTaxIdAlerts.size() + ", Approaching: " + warningAlerts.size();
+}
+else
+{
+	info "1099 monitor: No thresholds approached. " + totalPaymentsProcessed + " payments to " + paymentsByVendor.size() + " vendors analyzed.";
+}

@@ -1,0 +1,169 @@
+
+// ============================================================
+// SALES TAX NEXUS THRESHOLD MONITOR
+// Zoho Books Scheduled Function
+// ============================================================
+orgId = "917672270";
+alertEmail = "shivam@satvasolutions.com";
+alertCcEmail = "neha@satvasolutions.com";
+warningPercent = 1;
+// ---------- STATE THRESHOLDS ----------
+thresholds = Map();
+t = Map();
+t.put("name","California");
+t.put("revenue",100);
+thresholds.put("CA",t);
+t = Map();
+t.put("name","Texas");
+t.put("revenue",500000);
+thresholds.put("TX",t);
+t = Map();
+t.put("name","New York");
+t.put("revenue",500000);
+thresholds.put("NY",t);
+t = Map();
+t.put("name","Florida");
+t.put("revenue",100000);
+thresholds.put("FL",t);
+t = Map();
+t.put("name","Georgia");
+t.put("revenue",100000);
+thresholds.put("GA",t);
+t = Map();
+t.put("name","Washington");
+t.put("revenue",100000);
+thresholds.put("WA",t);
+// ---------- STATE NAME NORMALIZATION ----------
+stateMap = Map();
+stateMap.put("CALIFORNIA","CA");
+stateMap.put("TEXAS","TX");
+stateMap.put("NEW YORK","NY");
+stateMap.put("FLORIDA","FL");
+stateMap.put("GEORGIA","GA");
+stateMap.put("WASHINGTON","WA");
+// ---------- STATES WITH NO SALES TAX ----------
+noSalesTaxStates = List();
+noSalesTaxStates.add("DE");
+noSalesTaxStates.add("MT");
+noSalesTaxStates.add("NH");
+noSalesTaxStates.add("OR");
+noSalesTaxStates.add("AK");
+// ---------- DATE RANGE ----------
+currentYear = zoho.currentdate.getYear();
+startDate = currentYear + "-01-01";
+endDate = zoho.currentdate.toString("yyyy-MM-dd");
+// ---------- AGGREGATION MAPS ----------
+revenueByState = Map();
+countByState = Map();
+totalInvoicesProcessed = 0;
+hasMore = true;
+// ---------- PAGE ITERATION LIST (replaces while loop) ----------
+// Deluge does not support while loops — simulate with for each over page numbers
+pageList = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50};
+// ---------- FETCH INVOICES ----------
+for each  page in pageList
+{
+	if(hasMore == true)
+	{
+		invoiceUrl = "https://www.zohoapis.com/books/v3/invoices?organization_id=" + orgId + "&filter_by=Status.Paid" + "&date_start=" + startDate + "&date_end=" + endDate + "&page=" + page + "&per_page=200";
+		response = invokeurl
+		[
+			url :invoiceUrl
+			type :GET
+			connection:"zohobooks"
+		];
+		info "Page " + page + " API Response: " + response.toString();
+		invoices = response.get("invoices");
+		if(invoices != null)
+		{
+			for each  inv in invoices
+			{
+				addr = inv.get("shipping_address");
+				if(addr == null)
+				{
+					addr = inv.get("billing_address");
+				}
+				if(addr != null && addr.get("state") != null)
+				{
+					rawState = addr.get("state").trim().toUpperCase();
+					if(rawState.length() == 2)
+					{
+						stateCode = rawState;
+					}
+					else
+					{
+						stateCode = stateMap.get(rawState);
+					}
+					if(stateCode != null && noSalesTaxStates.contains(stateCode) == false)
+					{
+						invoiceTotal = inv.get("total").toDecimal();
+						currentRev = ifnull(revenueByState.get(stateCode),0);
+						revenueByState.put(stateCode,currentRev + invoiceTotal);
+						currentCount = ifnull(countByState.get(stateCode),0);
+						countByState.put(stateCode,currentCount + 1);
+					}
+				}
+				totalInvoicesProcessed = totalInvoicesProcessed + 1;
+			}
+		}
+		pageContext = response.get("page_context");
+		if(pageContext != null && pageContext.get("has_more_page") == true)
+		{
+			hasMore = true;
+		}
+		else
+		{
+			hasMore = false;
+		}
+	}
+}
+// ---------- ALERT CHECK ----------
+// ---------- ALERT CHECK ----------
+criticalAlerts = List();
+warningAlerts = List();
+for each  stateCode in revenueByState.keys()
+{
+	// ✅ Fixed: .keySet() → .keys()
+	revenue = revenueByState.get(stateCode);
+	txnCount = ifnull(countByState.get(stateCode),0);
+	threshold = thresholds.get(stateCode);
+	if(threshold != null)
+	{
+		stateName = threshold.get("name");
+		revThreshold = threshold.get("revenue").toDecimal();
+		revPercent = (revenue / revThreshold * 100).toLong();
+		if(revPercent >= 100)
+		{
+			alertMsg = stateName + " (" + stateCode + ") Nexus exceeded. Revenue $" + revenue.toLong();
+			criticalAlerts.add(alertMsg);
+		}
+		else if(revPercent >= warningPercent)
+		{
+			alertMsg = stateName + " (" + stateCode + ") approaching nexus. Revenue $" + revenue.toLong();
+			warningAlerts.add(alertMsg);
+		}
+	}
+}
+// ---------- EMAIL ----------
+if(criticalAlerts.size() > 0 || warningAlerts.size() > 0)
+{
+	emailBody = "Sales Tax Nexus Monitor\n\n";
+	emailBody = emailBody + "Invoices analyzed: " + totalInvoicesProcessed + "\n\n";
+	for each  a in criticalAlerts
+	{
+		emailBody = emailBody + "CRITICAL: " + a + "\n";
+	}
+	for each  a in warningAlerts
+	{
+		emailBody = emailBody + "WARNING: " + a + "\n";
+	}
+	sendmail
+	[
+		from :zoho.adminuserid
+		to :alertEmail
+		cc:alertCcEmail
+		subject :"Sales Tax Nexus Monitor Alert"
+		message :emailBody
+	]
+}
+info "Nexus monitor completed. Invoices analyzed: " + totalInvoicesProcessed;
